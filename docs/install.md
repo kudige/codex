@@ -38,3 +38,29 @@ cargo clippy --tests
 # Run the tests.
 cargo test
 ``` 
+### Install the CLI binaries
+
+Both the interactive TUI (`codex`) and the non-interactive runner (`codex-exec`) can be installed with `cargo install`. By default, Cargo places binaries in `~/.cargo/bin`. Use `--root` when you want them installed in a different prefix.
+
+```bash
+# From the repository root
+cargo install --path codex-rs/cli --locked --root /path/to/install
+
+# Install the non-interactive binary as well (optional)
+cargo install --path codex-rs/exec --bin codex-exec --locked --root /path/to/install
+```
+
+Add `/path/to/install/bin` to your `PATH`, or call the binaries with their absolute paths. For example:
+
+```bash
+export PATH="/path/to/install/bin:$PATH"
+
+# Interactive mode
+codex
+
+# Non-interactive mode with session persistence / transcript logging
+codex exec --transcript-log ~/codex.log "summarise README"
+
+# Keep auto-resume metadata next to your project
+codex exec --session-store /path/to/project "continue"
+```

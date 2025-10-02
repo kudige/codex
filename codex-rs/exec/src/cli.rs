@@ -86,6 +86,26 @@ pub struct Cli {
     #[arg(long = "output-last-message")]
     pub last_message_file: Option<PathBuf>,
 
+    /// Directory where session metadata (e.g., resume IDs) should be stored.
+    #[arg(long = "session-store", value_name = "DIR")]
+    pub session_store: Option<PathBuf>,
+
+    /// Write the session transcript to FILE.
+    #[arg(long = "transcript-log", value_name = "FILE")]
+    pub transcript_log: Option<PathBuf>,
+
+    /// Force creation of a new session instead of reusing the previous one.
+    #[arg(long = "new-session", default_value_t = false)]
+    pub new_session: bool,
+
+    /// Show detailed output instead of concise status lines.
+    #[arg(
+        long = "verbose",
+        default_value_t = false,
+        conflicts_with = "transcript_log"
+    )]
+    pub verbose: bool,
+
     /// Initial instructions for the agent. If not provided as an argument (or
     /// if `-` is used), instructions are read from stdin.
     #[arg(value_name = "PROMPT")]

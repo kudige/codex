@@ -70,8 +70,10 @@ async fn chat_mode_stream_cli() {
     println!("Stderr:\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let hi_lines = stdout.lines().filter(|line| line.trim() == "hi").count();
-    assert_eq!(hi_lines, 1, "Expected exactly one line with 'hi'");
+    assert!(
+        stdout.contains("Final result:\nhi"),
+        "expected final result to contain 'hi' but got:\n{stdout}"
+    );
 
     server.verify().await;
 

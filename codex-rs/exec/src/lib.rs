@@ -1,14 +1,20 @@
 mod cli;
 mod event_processor;
+mod event_processor_with_concise_output;
 mod event_processor_with_human_output;
 pub mod event_processor_with_json_output;
 pub mod exec_events;
 pub mod experimental_event_processor_with_json_output;
+mod transcript_log;
 
+use std::fs;
+use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Context;
 pub use cli::Cli;
 use codex_core::AuthManager;
 use codex_core::BUILT_IN_OSS_MODEL_PROVIDER_ID;
@@ -25,18 +31,21 @@ use codex_core::protocol::Op;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
+use event_processor_with_concise_output::EventProcessorWithConciseOutput;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use experimental_event_processor_with_json_output::ExperimentalEventProcessorWithJsonOutput;
 use serde_json::Value;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::Command as ExecCommand;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor_with_json_output::EventProcessorWithJsonOutput;
+use crate::transcript_log::TranscriptLog;
 use codex_core::find_conversation_path_by_id_str;
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
@@ -52,6 +61,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         skip_git_repo_check,
         color,
         last_message_file,
+        session_store,
+        transcript_log,
+        new_session,
+        verbose,
         json: json_mode,
         experimental_json,
         sandbox_mode: sandbox_mode_cli_arg,
@@ -104,6 +117,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     };
 
     let output_schema = load_output_schema(output_schema_path);
+
+    let session_store_dir = match session_store {
+        Some(dir) => dir,
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
 
     let (stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -182,21 +200,36 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     };
 
     let config = Config::load_with_cli_overrides(cli_kv_overrides, overrides)?;
-    let mut event_processor: Box<dyn EventProcessor> = match (json_mode, experimental_json) {
-        (_, true) => Box::new(ExperimentalEventProcessorWithJsonOutput::new(
+
+    let mut transcript_log =
+        match transcript_log {
+            Some(path) => Some(TranscriptLog::create(&path).with_context(|| {
+                format!("failed to create transcript log at {}", path.display())
+            })?),
+            None => None,
+        };
+
+    let mut event_processor: Box<dyn EventProcessor> = match (json_mode, experimental_json, verbose)
+    {
+        (_, true, _) => Box::new(ExperimentalEventProcessorWithJsonOutput::new(
             last_message_file.clone(),
         )),
-        (true, _) => {
+        (true, _, _) => {
             eprintln!(
                 "The existing `--json` output format is being deprecated. Please try the new format using `--experimental-json`."
             );
 
             Box::new(EventProcessorWithJsonOutput::new(last_message_file.clone()))
         }
-        _ => Box::new(EventProcessorWithHumanOutput::create_with_ansi(
+        (_, _, true) => Box::new(EventProcessorWithHumanOutput::create_with_ansi(
             stdout_with_ansi,
             &config,
             last_message_file.clone(),
+        )),
+        _ => Box::new(EventProcessorWithConciseOutput::new(
+            stdout_with_ansi,
+            last_message_file.clone(),
+            transcript_log.take(),
         )),
     };
 
@@ -221,32 +254,74 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let conversation_manager =
         ConversationManager::new(AuthManager::shared(config.codex_home.clone()));
 
-    // Handle resume subcommand by resolving a rollout path and using explicit resume API.
-    let NewConversation {
-        conversation_id: _,
-        conversation,
-        session_configured,
-    } = if let Some(ExecCommand::Resume(args)) = command {
-        let resume_path = resolve_resume_path(&config, &args).await?;
+    let persisted_session_id = if command.is_none() && !new_session {
+        load_persisted_session_id(session_store_dir.as_path())
+    } else {
+        None
+    };
 
-        if let Some(path) = resume_path {
-            conversation_manager
-                .resume_conversation_from_rollout(
-                    config.clone(),
-                    path,
-                    AuthManager::shared(config.codex_home.clone()),
-                )
-                .await?
-        } else {
-            conversation_manager
-                .new_conversation(config.clone())
-                .await?
+    let persisted_resume_path = if let Some(id) = persisted_session_id.as_deref() {
+        match find_conversation_path_by_id_str(&config.codex_home, id).await {
+            Ok(Some(path)) => {
+                info!(session_id = %id, "Automatically resuming previous session");
+                Some(path)
+            }
+            Ok(None) => {
+                warn!(session_id = %id, "Persisted session not found, starting new session");
+                clear_persisted_session_id(session_store_dir.as_path());
+                None
+            }
+            Err(err) => {
+                warn!(?err, session_id = %id, "Failed to locate persisted session, starting new session");
+                None
+            }
         }
     } else {
-        conversation_manager
-            .new_conversation(config.clone())
-            .await?
+        None
     };
+
+    // Handle resume subcommand by resolving a rollout path and using explicit resume API.
+    let NewConversation {
+        conversation_id,
+        conversation,
+        session_configured,
+    } = match command {
+        Some(ExecCommand::Resume(args)) => {
+            let resume_path = resolve_resume_path(&config, &args).await?;
+
+            if let Some(path) = resume_path {
+                conversation_manager
+                    .resume_conversation_from_rollout(
+                        config.clone(),
+                        path,
+                        AuthManager::shared(config.codex_home.clone()),
+                    )
+                    .await?
+            } else {
+                conversation_manager
+                    .new_conversation(config.clone())
+                    .await?
+            }
+        }
+        None => {
+            if let Some(path) = persisted_resume_path {
+                conversation_manager
+                    .resume_conversation_from_rollout(
+                        config.clone(),
+                        path,
+                        AuthManager::shared(config.codex_home.clone()),
+                    )
+                    .await?
+            } else {
+                conversation_manager
+                    .new_conversation(config.clone())
+                    .await?
+            }
+        }
+    };
+
+    let session_id_str = conversation_id.to_string();
+    persist_session_id(session_store_dir.as_path(), &session_id_str);
     // Print the effective configuration and prompt so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt, &session_configured);
@@ -399,5 +474,57 @@ fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
             );
             std::process::exit(1);
         }
+    }
+}
+
+const SESSION_STATE_DIR: &str = "state";
+const EXEC_LAST_SESSION_FILE: &str = "codex_exec_last_session_id";
+
+fn persisted_session_file(session_store_dir: &Path) -> PathBuf {
+    session_store_dir
+        .join(SESSION_STATE_DIR)
+        .join(EXEC_LAST_SESSION_FILE)
+}
+
+fn load_persisted_session_id(session_store_dir: &Path) -> Option<String> {
+    let path = persisted_session_file(session_store_dir);
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(err) => {
+            if err.kind() != ErrorKind::NotFound {
+                warn!(?err, path = %path.display(), "Failed to read persisted session id");
+            }
+            None
+        }
+    }
+}
+
+fn persist_session_id(session_store_dir: &Path, session_id: &str) {
+    let path = persisted_session_file(session_store_dir);
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        warn!(?err, path = %parent.display(), "Failed to create session state directory");
+        return;
+    }
+
+    if let Err(err) = fs::write(&path, session_id) {
+        warn!(?err, path = %path.display(), "Failed to persist session id");
+    }
+}
+
+fn clear_persisted_session_id(session_store_dir: &Path) {
+    let path = persisted_session_file(session_store_dir);
+    if let Err(err) = fs::remove_file(&path)
+        && err.kind() != ErrorKind::NotFound
+    {
+        warn!(?err, path = %path.display(), "Failed to clear persisted session id");
     }
 }

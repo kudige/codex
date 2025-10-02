@@ -87,6 +87,8 @@ fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .env("OPENAI_BASE_URL", "http://unused.local")
         .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
         .arg("-C")
         .arg(env!("CARGO_MANIFEST_DIR"))
         .arg(&prompt)
@@ -110,6 +112,8 @@ fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .env("OPENAI_BASE_URL", "http://unused.local")
         .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
         .arg("-C")
         .arg(env!("CARGO_MANIFEST_DIR"))
         .arg(&prompt2)
@@ -147,6 +151,8 @@ fn exec_resume_by_id_appends_to_existing_file() -> anyhow::Result<()> {
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .env("OPENAI_BASE_URL", "http://unused.local")
         .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
         .arg("-C")
         .arg(env!("CARGO_MANIFEST_DIR"))
         .arg(&prompt)
@@ -174,6 +180,8 @@ fn exec_resume_by_id_appends_to_existing_file() -> anyhow::Result<()> {
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .env("OPENAI_BASE_URL", "http://unused.local")
         .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
         .arg("-C")
         .arg(env!("CARGO_MANIFEST_DIR"))
         .arg(&prompt2)
@@ -209,6 +217,8 @@ fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<()> {
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .env("OPENAI_BASE_URL", "http://unused.local")
         .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
         .arg("--sandbox")
         .arg("workspace-write")
         .arg("--model")
@@ -233,6 +243,8 @@ fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<()> {
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         .env("OPENAI_BASE_URL", "http://unused.local")
         .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
         .arg("--sandbox")
         .arg("workspace-write")
         .arg("--model")
@@ -264,5 +276,106 @@ fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<()> {
     let content = std::fs::read_to_string(&resumed_path)?;
     assert!(content.contains(&marker));
     assert!(content.contains(&marker2));
+    Ok(())
+}
+
+#[test]
+fn exec_auto_resume_persists_session_id() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cli_responses_fixture.sse");
+
+    let marker1 = format!("auto-resume-{}", Uuid::new_v4());
+    let prompt1 = format!("echo {marker1}");
+
+    Command::cargo_bin("codex-exec")
+        .context("should find binary for codex-exec")?
+        .env("CODEX_HOME", home.path())
+        .env("OPENAI_API_KEY", "dummy")
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .env("OPENAI_BASE_URL", "http://unused.local")
+        .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&prompt1)
+        .assert()
+        .success();
+
+    let state_file = home.path().join("state").join("codex_exec_last_session_id");
+    let session_id1 = std::fs::read_to_string(&state_file)?.trim().to_string();
+    assert!(
+        !session_id1.is_empty(),
+        "first run should persist a session id"
+    );
+
+    let sessions_dir = home.path().join("sessions");
+    let session_path1 = find_session_file_containing_marker(&sessions_dir, &marker1)
+        .expect("no session file found after first run");
+
+    let marker2 = format!("auto-resume-2-{}", Uuid::new_v4());
+    let prompt2 = format!("echo {marker2}");
+
+    Command::cargo_bin("codex-exec")
+        .context("should find binary for codex-exec")?
+        .env("CODEX_HOME", home.path())
+        .env("OPENAI_API_KEY", "dummy")
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .env("OPENAI_BASE_URL", "http://unused.local")
+        .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&prompt2)
+        .assert()
+        .success();
+
+    let session_id2 = std::fs::read_to_string(&state_file)?.trim().to_string();
+    assert_eq!(
+        session_id1, session_id2,
+        "second run should reuse session id"
+    );
+
+    let session_path2 = find_session_file_containing_marker(&sessions_dir, &marker2)
+        .expect("no resumed session file containing marker2");
+    assert_eq!(
+        session_path1, session_path2,
+        "auto resume should append to previous session file"
+    );
+
+    let marker3 = format!("auto-resume-3-{}", Uuid::new_v4());
+    let prompt3 = format!("echo {marker3}");
+
+    Command::cargo_bin("codex-exec")
+        .context("should find binary for codex-exec")?
+        .env("CODEX_HOME", home.path())
+        .env("OPENAI_API_KEY", "dummy")
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .env("OPENAI_BASE_URL", "http://unused.local")
+        .arg("--skip-git-repo-check")
+        .arg("--session-store")
+        .arg(home.path())
+        .arg("--new-session")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&prompt3)
+        .assert()
+        .success();
+
+    let session_id3 = std::fs::read_to_string(&state_file)?.trim().to_string();
+    assert_ne!(
+        session_id1, session_id3,
+        "--new-session should create a fresh session id"
+    );
+
+    let session_path3 = find_session_file_containing_marker(&sessions_dir, &marker3)
+        .expect("no session file found for new session");
+    assert_ne!(
+        session_path1, session_path3,
+        "new session should create a new rollout file"
+    );
+
     Ok(())
 }
